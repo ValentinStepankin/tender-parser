@@ -16,6 +16,7 @@ def analyze(text: str, config: dict, mode: str) -> dict:
     Анализировать текст тендера через LLM.
     mode: 'api' | 'ollama'
     Возвращает dict с полями из config['fields'].
+    Значения — строки для обычных полей, list[dict] для полей с type:list.
     """
     max_tokens = config.get('max_chunk_tokens', 20000)
     chunks = _split_text(text, max_tokens)
@@ -37,7 +38,6 @@ def _split_text(text: str, max_tokens: int) -> list:
     if len(text) <= max_chars:
         return [text]
 
-    # Разбиваем по разделителям документов, сохраняя разделитель в начале каждой части
     parts = re.split(r'(?=^=== .+ ===$)', text, flags=re.MULTILINE)
 
     chunks = []
@@ -91,7 +91,12 @@ def _build_fields_schema(config: dict) -> str:
     json_lines = ['{']
     for i, f in enumerate(fields):
         comma = ',' if i < len(fields) - 1 else ''
-        json_lines.append(f'  "{f["name"]}": ""{comma}')
+        if f.get('type') == 'list':
+            item_keys = [item['key'] for item in f.get('item_schema', [])]
+            item_obj = '{' + ', '.join(f'"{k}": ""' for k in item_keys) + '}'
+            json_lines.append(f'  "{f["name"]}": [{item_obj}]{comma}')
+        else:
+            json_lines.append(f'  "{f["name"]}": ""{comma}')
     json_lines.append('}')
 
     if desc_lines:
@@ -156,16 +161,13 @@ def _call_api(prompt: str, config: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _parse_response(raw: str, config: dict) -> dict:
-    # Убрать thinking-блоки Qwen3 (на случай если /no_think не сработал)
     raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
 
-    # Прямой парсинг
     try:
         return _validate(json.loads(raw), config)
     except (json.JSONDecodeError, AttributeError):
         pass
 
-    # Извлечь первый JSON-объект из текста
     match = re.search(r'\{.*\}', raw, re.DOTALL)
     if match:
         try:
@@ -173,13 +175,77 @@ def _parse_response(raw: str, config: dict) -> dict:
         except json.JSONDecodeError:
             pass
 
-    fields = [f['name'] for f in config.get('fields', [])]
-    return {field: '' for field in fields}
+    return _empty_result(config)
+
+
+def _empty_result(config: dict) -> dict:
+    result = {}
+    for f in config.get('fields', []):
+        result[f['name']] = [] if f.get('type') == 'list' else ''
+    return result
 
 
 def _validate(data: dict, config: dict) -> dict:
-    fields = [f['name'] for f in config.get('fields', [])]
-    return {field: str(data.get(field, '') or '').strip() for field in fields}
+    result = {}
+    for f in config.get('fields', []):
+        name = f['name']
+        if f.get('type') == 'list':
+            result[name] = _validate_list(data.get(name), f)
+        else:
+            result[name] = str(data.get(name, '') or '').strip()
+    return result
+
+
+def _validate_list(value, field: dict) -> list:
+    """Привести значение list-поля к списку объектов с подполями из item_schema.
+    Подполе с numeric:true приводится к числу (int/float) или к '' если не парсится."""
+    if not isinstance(value, list):
+        return []
+    schema = field.get('item_schema', [])
+    cleaned = []
+    for elem in value:
+        if not isinstance(elem, dict):
+            continue
+        obj = {}
+        for sub in schema:
+            raw = elem.get(sub['key'], '')
+            obj[sub['key']] = _to_number(raw) if sub.get('numeric') else _stringify(raw)
+        if any(v != '' for v in obj.values()):
+            cleaned.append(obj)
+    return cleaned
+
+
+def _stringify(value) -> str:
+    """Привести значение к строке без лишних пробелов."""
+    if value is None or isinstance(value, bool):
+        return ''
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+    return str(value).strip()
+
+
+def _to_number(value):
+    """Привести значение к числу. Возвращает int (если целое), float или '' если не парсится."""
+    if isinstance(value, bool):
+        return ''
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+    if not isinstance(value, str):
+        return ''
+    # очистка: убираем пробелы, ₽, руб., запятые → точки
+    s = value.strip().replace('₽', '').replace('руб.', '').replace('руб', '')
+    s = s.replace('\xa0', '').replace(' ', '').replace(',', '.')
+    if not s:
+        return ''
+    try:
+        n = float(s)
+    except ValueError:
+        return ''
+    return int(n) if n.is_integer() else n
 
 
 # ---------------------------------------------------------------------------
@@ -187,13 +253,16 @@ def _validate(data: dict, config: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _merge_results(results: list, config: dict) -> dict:
-    """Первое непустое значение по каждому полю; merge:concat — объединяем все."""
+    """Для list-полей — конкатенация массивов из всех чанков.
+    Для строковых полей — первое непустое значение."""
     merged = {}
     for f in config.get('fields', []):
         name = f['name']
-        if f.get('merge') == 'concat':
-            parts = [r[name] for r in results if r.get(name)]
-            merged[name] = '\n'.join(parts)
+        if f.get('type') == 'list':
+            combined = []
+            for r in results:
+                combined.extend(r.get(name) or [])
+            merged[name] = combined
         else:
             merged[name] = next((r[name] for r in results if r.get(name)), '')
     return merged

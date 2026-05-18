@@ -17,7 +17,7 @@ import yaml
 from dotenv import load_dotenv
 
 from analyzer import APICallError, analyze
-from exporter import append_row
+from exporter import append_rows
 from extractor import extract_archive, extract_tender, is_archive, peek_archive_contents
 
 
@@ -98,8 +98,7 @@ def main():
                 continue
 
             print(f"[{i}/{total}] {name} — готово")
-            fields = [f['name'] for f in config.get('fields', [])]
-            append_row(xlsx_path, name, data, fields)
+            append_rows(xlsx_path, name, data, config.get('fields', []))
 
     if args.mode:
         print(f"\nГотово. Excel: {xlsx_path}")
