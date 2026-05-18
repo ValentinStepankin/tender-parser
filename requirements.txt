@@ -1,0 +1,12 @@
+python-dotenv
+pyyaml
+openai
+requests
+rarfile
+python-docx
+PyMuPDF
+striprtf
+openpyxl
+xlrd
+odfpy
+chardet
