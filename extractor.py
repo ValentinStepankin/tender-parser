@@ -139,6 +139,16 @@ def _collect_docs(directory: Path, errors_log_path) -> list:
 # Распаковка архивов
 # ---------------------------------------------------------------------------
 
+def _sanitize_filename_for_fs(name: str) -> str:
+    # На Windows запрещены " : < > | ? * в именах файлов — заменяем на _
+    import sys
+    if sys.platform != 'win32':
+        return name
+    invalid = '"<>|?*:'
+    parts = name.replace('\\', '/').split('/')
+    return '/'.join(''.join('_' if c in invalid else c for c in p) for p in parts)
+
+
 def _extract_zip(zip_path: Path, dest: Path, errors_log_path):
     # Сначала пробуем zipfile — быстрый, корректно правит CP866-имена
     try:
@@ -153,13 +163,18 @@ def _extract_zip(zip_path: Path, dest: Path, errors_log_path):
                     except (UnicodeEncodeError, UnicodeDecodeError):
                         filename = member.filename
 
+                filename = _sanitize_filename_for_fs(filename)
                 target = dest / filename
                 if member.is_dir():
                     target.mkdir(parents=True, exist_ok=True)
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(member) as src, open(target, 'wb') as dst:
-                    dst.write(src.read())
+                try:
+                    with zf.open(member) as src, open(target, 'wb') as dst:
+                        dst.write(src.read())
+                except OSError as e:
+                    _log_error(errors_log_path, str(target), f"Не удалось сохранить файл: {e}")
+                    continue
         return
     except zipfile.BadZipFile:
         pass  # битый zip — пробуем unar
