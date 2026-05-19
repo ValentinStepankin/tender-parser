@@ -6,14 +6,20 @@ ollama:
 api:
   model: deepseek/deepseek-v4-flash:free
   base_url: https://openrouter.ai/api/v1
-  # model: gemini-2.0-flash               # Google AI Studio
+
+  # model: gemini-2.0-flash                 # Google AI Studio (временно 2026-05-19 для теста)
   # base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+
   # model: llama-3.3-70b-versatile        # Groq
   # base_url: https://api.groq.com/openai/v1
-  # base_url: https://api.openai.com/v1   # ChatGPT
-  # model: gpt-4o-mini                    # модель для GPT
 
-max_chunk_tokens: 60000
+  # model: gpt-4o-mini                    # модель для GPT
+  # base_url: https://api.openai.com/v1   # ChatGPT
+
+# Максимальный размер одного куска (chunk) текста тендера, отправляемого модели за раз.
+# Если текст тендера превышает этот лимит — он режется на части по границам документов.
+# Ориентировочный пересчёт: 1 токен ≈ 3 символа русского текста.
+max_chunk_tokens: 100000
 
 # Поля для извлечения из тендера → колонки в Excel.
 #

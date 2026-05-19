@@ -64,7 +64,12 @@ def main():
                 if not source_path.exists() or source_path.stat().st_size == 0:
                     print(f"[{i}/{total}] {name} — пропущен (пустой архив)")
                     continue
-                text = extract_tender(source, errors_log)
+                if source_path.suffix.lower() == '.txt':
+                    # Источник — готовый .txt (например, ранее распакованный на другой машине).
+                    # Читаем напрямую без extract_tender, чтобы не оборачивать в лишний "=== file.txt ===".
+                    text = source_path.read_text(encoding='utf-8')
+                else:
+                    text = extract_tender(source, errors_log)
                 if not text.strip():
                     print(f"[{i}/{total}] {name} — пропущен (нет текста)")
                     continue
@@ -80,7 +85,7 @@ def main():
 
             # Анализ через LLM
             try:
-                data = analyze(text, config, args.mode)
+                data, raw_responses = analyze(text, config, args.mode)
             except APICallError as e:
                 _log_error(errors_log, name, f"Ошибка API: {e}")
                 print(f"\n[{i}/{total}] {name} — ошибка API, прогон остановлен:")
@@ -94,6 +99,7 @@ def main():
             filled = sum(1 for v in data.values() if v and str(v).strip())
             if filled < 3:
                 _log_error(errors_log, name, f"Модель вернула менее 3 полей ({filled})")
+                _log_raw_responses(errors_log.parent / 'llm_debug.log', name, filled, raw_responses)
                 print(f"[{i}/{total}] {name} — пропущен (модель вернула {filled} поля(ей))")
                 continue
 
@@ -138,8 +144,8 @@ def _discover_tenders(input_path: Path, tmp_dir: Path, errors_log: Path) -> list
 
 
 def _tenders_from_dir(directory: Path) -> list:
-    """Найти тендеры в папке: архивы и одиночные документы."""
-    doc_exts = {'.doc', '.docx', '.pdf', '.rtf', '.odt'}
+    """Найти тендеры в папке: архивы, одиночные документы, готовые .txt."""
+    doc_exts = {'.doc', '.docx', '.pdf', '.rtf', '.odt', '.txt'}
     tenders = []
     for item in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
         if not item.is_file():
@@ -192,6 +198,19 @@ def _log_error(log_path: Path, filename: str, reason: str):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with open(log_path, 'a', encoding='utf-8') as f:
         f.write(f"{timestamp} | {filename} | {reason}\n")
+
+
+def _log_raw_responses(log_path: Path, tender_name: str, filled: int, raw_responses: list):
+    """Записать сырые ответы модели в дебаг-лог. Используется когда модель
+    вернула меньше 3 заполненных полей — даёт возможность увидеть что именно
+    она ответила (обрезанный JSON, пустой ответ, мусор и т.д.)."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write(f"\n=== {timestamp} | {tender_name} | filled={filled} ===\n")
+        for idx, raw in enumerate(raw_responses, start=1):
+            f.write(f"--- chunk {idx}/{len(raw_responses)} ---\n")
+            f.write((raw or '<пустой ответ>') + '\n')
 
 
 if __name__ == '__main__':

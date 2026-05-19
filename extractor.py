@@ -38,9 +38,11 @@ def extract_tender(source, errors_log_path=None) -> str:
 
         if ext == '.zip':
             _extract_zip(source, tmpdir, errors_log_path)
+            _sanitize_extracted_dir(tmpdir)
             docs = _collect_docs(tmpdir, errors_log_path)
         elif ext == '.rar':
             _extract_rar(source, tmpdir, errors_log_path)
+            _sanitize_extracted_dir(tmpdir)
             docs = _collect_docs(tmpdir, errors_log_path)
         else:
             text = _extract_file_text(source, errors_log_path)
@@ -57,10 +59,12 @@ def extract_archive(archive_path, dest, errors_log_path=None):
     """Распаковать архив в папку dest."""
     path = Path(archive_path)
     ext = path.suffix.lower()
+    dest = Path(dest)
     if ext == '.zip':
-        _extract_zip(path, Path(dest), errors_log_path)
+        _extract_zip(path, dest, errors_log_path)
     elif ext == '.rar':
-        _extract_rar(path, Path(dest), errors_log_path)
+        _extract_rar(path, dest, errors_log_path)
+    _sanitize_extracted_dir(dest)
 
 
 def peek_archive_contents(archive_path) -> list:
@@ -105,6 +109,7 @@ def _collect_docs(directory: Path, errors_log_path) -> list:
             try:
                 with tempfile.TemporaryDirectory() as sub_tmp:
                     _extract_zip(item, Path(sub_tmp), errors_log_path)
+                    _sanitize_extracted_dir(Path(sub_tmp))
                     sub_docs = _collect_docs(Path(sub_tmp), errors_log_path)
                 result.extend(sub_docs)
             except OSError as e:
@@ -118,6 +123,7 @@ def _collect_docs(directory: Path, errors_log_path) -> list:
             try:
                 with tempfile.TemporaryDirectory() as sub_tmp:
                     _extract_rar(item, Path(sub_tmp), errors_log_path)
+                    _sanitize_extracted_dir(Path(sub_tmp))
                     sub_docs = _collect_docs(Path(sub_tmp), errors_log_path)
                 result.extend(sub_docs)
             except OSError as e:
@@ -139,14 +145,46 @@ def _collect_docs(directory: Path, errors_log_path) -> list:
 # Распаковка архивов
 # ---------------------------------------------------------------------------
 
+_INVALID_WIN_CHARS = '"<>|?*:'
+
+
 def _sanitize_filename_for_fs(name: str) -> str:
     # На Windows запрещены " : < > | ? * в именах файлов — заменяем на _
     import sys
     if sys.platform != 'win32':
         return name
-    invalid = '"<>|?*:'
     parts = name.replace('\\', '/').split('/')
-    return '/'.join(''.join('_' if c in invalid else c for c in p) for p in parts)
+    return '/'.join(''.join('_' if c in _INVALID_WIN_CHARS else c for c in p) for p in parts)
+
+
+def _sanitize_extracted_dir(directory: Path):
+    """Переименовать в директории все файлы/папки с недопустимыми Windows-символами.
+
+    Покрывает случаи когда распаковка прошла через unar / rarfile, которые
+    кладут файлы с оригинальными именами и не применяют санитизацию.
+    Идём от листьев к корню — иначе переименование папки сломает пути к файлам внутри.
+    """
+    import sys
+    if sys.platform != 'win32':
+        return
+
+    items = sorted(directory.rglob('*'), key=lambda p: len(p.parts), reverse=True)
+    for item in items:
+        name = item.name
+        if not any(c in name for c in _INVALID_WIN_CHARS):
+            continue
+        new_name = ''.join('_' if c in _INVALID_WIN_CHARS else c for c in name)
+        target = item.parent / new_name
+        if target.exists() and target != item:
+            stem, suffix = target.stem, target.suffix
+            i = 1
+            while target.exists():
+                target = item.parent / f"{stem}_{i}{suffix}"
+                i += 1
+        try:
+            item.rename(target)
+        except OSError:
+            pass  # не удалось переименовать — _collect_docs пропустит файл с ошибкой в лог
 
 
 def _extract_zip(zip_path: Path, dest: Path, errors_log_path):
@@ -356,7 +394,23 @@ def _extract_html_file(path: Path) -> str:
     return _extract_html_bytes(_read_bytes(path))
 
 
+_BLOCK_TAGS = frozenset({
+    'p', 'div', 'tr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'li', 'ul', 'ol', 'table', 'thead', 'tbody',
+    'blockquote', 'pre', 'article', 'section', 'header', 'footer',
+})
+_CELL_TAGS = frozenset({'td', 'th'})
+
+
 def _extract_html_bytes(raw: bytes) -> str:
+    """Извлечь текст из HTML с сохранением структуры:
+    - перенос строки между блочными элементами (p, div, tr, h1..h6, li и т.д.)
+    - таб между ячейками таблицы (td, th)
+    - явный <br> тоже даёт перенос строки
+
+    Без этого таблицы (особенно из извещений zakupki.gov.ru — это .doc/HTML с таблицами)
+    склеиваются в одну плотную строку, и LLM теряет структуру позиций.
+    """
     from html.parser import HTMLParser
 
     encoding = _detect_encoding(raw)
@@ -371,20 +425,42 @@ def _extract_html_bytes(raw: bytes) -> str:
         def handle_starttag(self, tag, attrs):
             if tag in ('script', 'style'):
                 self._skip += 1
+            elif tag == 'br':
+                self.parts.append('\n')
+
+        def handle_startendtag(self, tag, attrs):
+            if tag == 'br':
+                self.parts.append('\n')
 
         def handle_endtag(self, tag):
             if tag in ('script', 'style'):
                 self._skip = max(0, self._skip - 1)
+            elif tag == 'tr':
+                self.parts.append('\n')
+            elif tag in _CELL_TAGS:
+                self.parts.append('\t')
+            elif tag in _BLOCK_TAGS:
+                self.parts.append('\n')
 
         def handle_data(self, data):
             if not self._skip:
                 s = data.strip()
                 if s:
                     self.parts.append(s)
+                    self.parts.append(' ')
 
     parser = _TextExtractor()
     parser.feed(text)
-    return ' '.join(parser.parts)
+
+    result = ''.join(parser.parts)
+    # нормализация: убрать лишние пробелы вокруг разделителей, схлопнуть пустые строки
+    result = re.sub(r' +', ' ', result)         # схлопнуть только обычные пробелы (табы между ячейками сохраняем)
+    result = re.sub(r' *\t *', '\t', result)    # убрать пробелы вокруг таба
+    result = re.sub(r'\t+', '\t', result)       # схлопнуть кратные табы
+    result = re.sub(r'\t+\n', '\n', result)     # убрать табы в конце строки (после последней ячейки <tr>)
+    result = re.sub(r' *\n *', '\n', result)    # убрать пробелы вокруг \n
+    result = re.sub(r'\n{3,}', '\n\n', result)  # макс 2 \n подряд
+    return result.strip()
 
 
 # --- RTF ---

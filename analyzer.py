@@ -11,21 +11,27 @@ class APICallError(Exception):
     """Любая ошибка на стороне API или Ollama."""
 
 
-def analyze(text: str, config: dict, mode: str) -> dict:
+def analyze(text: str, config: dict, mode: str) -> tuple:
     """
     Анализировать текст тендера через LLM.
     mode: 'api' | 'ollama'
-    Возвращает dict с полями из config['fields'].
-    Значения — строки для обычных полей, list[dict] для полей с type:list.
+    Возвращает кортеж (data, raw_responses):
+      data — dict с полями из config['fields']. Значения — строки для обычных
+             полей, list[dict] для полей с type:list.
+      raw_responses — список сырых строк-ответов модели, по одному на каждый
+             отправленный чанк. Используется для диагностики (логируется
+             в tender.py при низкокачественном результате).
     """
     max_tokens = config.get('max_chunk_tokens', 20000)
     chunks = _split_text(text, max_tokens)
 
-    results = [_analyze_chunk(chunk, config, mode) for chunk in chunks]
+    pairs = [_analyze_chunk(chunk, config, mode) for chunk in chunks]
+    results = [p[0] for p in pairs]
+    raws = [p[1] for p in pairs]
 
     if len(results) == 1:
-        return results[0]
-    return _merge_results(results, config)
+        return results[0], raws
+    return _merge_results(results, config), raws
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +64,8 @@ def _split_text(text: str, max_tokens: int) -> list:
 # Анализ одного чанка
 # ---------------------------------------------------------------------------
 
-def _analyze_chunk(text: str, config: dict, mode: str) -> dict:
+def _analyze_chunk(text: str, config: dict, mode: str) -> tuple:
+    """Анализирует один чанк. Возвращает (parsed_data, raw_response)."""
     prompt_path = Path(__file__).parent / 'prompts' / 'analyze_tender.txt'
     with open(prompt_path, 'r', encoding='utf-8') as f:
         template = f.read()
@@ -75,7 +82,7 @@ def _analyze_chunk(text: str, config: dict, mode: str) -> dict:
     else:
         raw = _call_api(prompt, config)
 
-    return _parse_response(raw, config)
+    return _parse_response(raw, config), raw
 
 
 def _build_fields_schema(config: dict) -> str:
@@ -253,16 +260,46 @@ def _to_number(value):
 # ---------------------------------------------------------------------------
 
 def _merge_results(results: list, config: dict) -> dict:
-    """Для list-полей — конкатенация массивов из всех чанков.
-    Для строковых полей — первое непустое значение."""
+    """Слияние результатов из чанков.
+
+    Для list-полей — выбор чанка с самым полным массивом (избегает дублей,
+    когда одна и та же таблица позиций повторяется в извещении, ТЗ и проекте контракта).
+    Для строковых полей — первое непустое значение из всех чанков.
+    """
     merged = {}
     for f in config.get('fields', []):
         name = f['name']
         if f.get('type') == 'list':
-            combined = []
-            for r in results:
-                combined.extend(r.get(name) or [])
-            merged[name] = combined
+            chunks = [r.get(name) or [] for r in results]
+            merged[name] = _pick_best_chunk(chunks)
         else:
             merged[name] = next((r[name] for r in results if r.get(name)), '')
     return merged
+
+
+def _pick_best_chunk(chunks: list) -> list:
+    """Выбрать массив позиций из «самого полного» чанка.
+
+    Метрика (по убыванию приоритета):
+      1) число позиций (больше = лучше)
+      2) суммарное число заполненных подполей по всем позициям
+      3) индекс чанка (меньший выигрывает — первый чанк содержит Извещение,
+         оно официальный источник позиций)
+    """
+    if not chunks:
+        return []
+
+    def score(positions: list) -> tuple:
+        n = len(positions)
+        filled = sum(
+            1
+            for p in positions
+            if isinstance(p, dict)
+            for v in p.values()
+            if v not in ('', None)
+        )
+        return (n, filled)
+
+    # max по (score, -i) → при равенстве score меньший индекс выигрывает
+    best_idx = max(range(len(chunks)), key=lambda i: (score(chunks[i]), -i))
+    return chunks[best_idx]
